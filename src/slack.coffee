@@ -8,6 +8,7 @@ Util = require 'util'
 class SlackBot extends Adapter
   @MAX_MESSAGE_LENGTH: 4000
   @MIN_MESSAGE_LENGTH: 1
+  @RESERVED_KEYWORDS: ['channel','group','everyone','here']
 
   constructor: (robot) ->
     @robot = robot
@@ -46,10 +47,7 @@ class SlackBot extends Adapter
   error: (error) =>
     return @robot.logger.warning "Received rate limiting error #{JSON.stringify error}" if error.code == -1
 
-    @robot.logger.error "Received error #{JSON.stringify error}"
-    @robot.logger.error error.stack
-    @robot.logger.error "Exiting in 1 second"
-    setTimeout process.exit.bind(process, 1), 1000
+    @robot.emit 'error', error
 
   loggedIn: (self, team) =>
     @robot.logger.info "Logged in as #{self.name} of #{team.name}, but not yet connected"
@@ -73,7 +71,18 @@ class SlackBot extends Adapter
       if id is user.name then delete @robot.brain.data.users[user.id]
 
   userChange: (user) =>
-    newUser = {name: user.name, real_name: user.real_name, email_address: user.profile.email}
+    return unless user?.id?
+    newUser =
+      name: user.name
+      real_name: user.real_name
+      email_address: user.profile.email
+      slack: {}
+    for key, value of user
+      # don't store the SlackClient, because it'd cause a circular reference
+      # (it contains users and channels), and because it has sensitive information like the token
+      continue if value instanceof SlackClient
+      newUser.slack[key] = value
+
     if user.id of @robot.brain.data.users
       for key, value of @robot.brain.data.users[user.id]
         unless key of newUser
@@ -183,7 +192,7 @@ class SlackBot extends Adapter
             return "\##{channel.name}"
 
         when '!'
-          if link in ['channel','group','everyone']
+          if link in SlackBot.RESERVED_KEYWORDS
             return "@#{link}"
 
         else
@@ -199,6 +208,7 @@ class SlackBot extends Adapter
 
   send: (envelope, messages...) ->
     channel = @client.getChannelGroupOrDMByName envelope.room
+    channel = @client.getChannelGroupOrDMByID(envelope.room) unless channel
 
     if not channel and @client.getUserByName(envelope.room)
       user_id = @client.getUserByName(envelope.room).id
@@ -208,6 +218,16 @@ class SlackBot extends Adapter
 
     for msg in messages
       continue if msg.length < SlackBot.MIN_MESSAGE_LENGTH
+
+      # Replace @username with <@UXXXXX> for mentioning users and channels
+      msg = msg.replace /(?:^| )@([\w]+)/gm, (match, p1) =>
+        user = @client.getUserByName p1
+        if user
+          match = match.replace /@[\w]+/, "<@#{user.id}>"
+        else if p1 in SlackBot.RESERVED_KEYWORDS
+          match = match.replace /@[\w]+/, "<!#{p1}>"
+        else
+          match = match
 
       @robot.logger.debug "Sending to #{envelope.room}: #{msg}"
 
@@ -251,7 +271,7 @@ class SlackBot extends Adapter
 
     for msg in messages
       # TODO: Don't prefix username if replying in DM
-      @send envelope, "#{envelope.user.name}: #{msg}"
+      @send envelope, "<@#{envelope.user.id}>: #{msg}"
 
   topic: (envelope, strings...) ->
     channel = @client.getChannelGroupOrDMByName envelope.room
@@ -266,6 +286,7 @@ class SlackBot extends Adapter
     else data.message.room
 
     channel = @client.getChannelGroupOrDMByName channelName
+    channel = @client.getChannelGroupOrDMByID(channelName) unless channel
     return unless channel
 
     msg = {}
